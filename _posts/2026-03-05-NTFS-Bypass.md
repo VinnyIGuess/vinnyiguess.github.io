@@ -19,9 +19,14 @@ After all of this was done, I was able to quickly pull out the device name (`\De
 ## Finding The Vulnerability
 The IOCTL handler `0x8000E000` executes a function (renamed by Claude to IoctlReadDiskSectors)  that processes a 112‑byte input buffer supplied by the caller.
 
+```c
+case 0x8000E000:
+      ProcessNotifyRoutine = IoctlReadDiskSectors(a2, p_MajorFunction, &v19);
+```
+
 Early in the function, the driver verifies the input size:
 
-```C
+```c
 if (v6 && *(_DWORD *)(a2 + 16) == 112)
 ```
 
@@ -29,7 +34,7 @@ if (v6 && *(_DWORD *)(a2 + 16) == 112)
 
 The first 100 (`0x64`) bytes of the buffer are validated as a NULL‑terminated string:
 
-```C
+```c
 do {
     if (*v9 == 0)
         break;
@@ -40,7 +45,7 @@ This indicates that the beginning of the buffer contains a device name.
 
 Further down, two additional fields are read directly from the buffer:
 
-```C
+```c
 v10 = *(_DWORD *)(v6 + 100);
 v19 = *(_QWORD *)(v6 + 104);
 ```
@@ -52,7 +57,7 @@ These offsets reveal the remaining structure fields:
 
 This is later passed to the function `IoBuildSynchronousFsdRequest` using `IRP_MJ_READ`, allowing for arbitrary read of disk sectors from user mode, effectively bypassing NTFS read restrictions entirely.
 
-```C
+```c
 v16 = IoBuildSynchronousFsdRequest(
     3u,                                          // IRP_MJ_READ (major function code = read)
     *(PDEVICE_OBJECT *)((char *)v11 + 241),     // Target device object (selected disk) 
@@ -68,7 +73,7 @@ v16 = IoBuildSynchronousFsdRequest(
 
 Based on this, the IOCTL input buffer for our POC can be crafted like:
 
-```C
+```cpp
 struct ReadSectorsInput
 {
     char     DiskName[100];
@@ -76,4 +81,38 @@ struct ReadSectorsInput
     uint64_t StartLba;
 };
 ```
+
+## Getting the Disk Name
+Knowing that the disk name would need to be passed into the vulnerable function, I looked to enumerate the disk name at runtime. Thankfully, the driver already does this for us at IOCTL `0x8000E004`.
+
+Looking at the implementation reveals that the driver maintains an internal linked list of disk records, which are populated by a helper function. The enumeration routine walks the Windows disk driver (`\Driver\Disk`) device chain and gathers metadata for each disk device object. Once enumeration has completed, IoctlEnumDiskDevices simply iterates over the linked list and copies each entry to the caller's output buffer.
+
+The following code shows 0xE1 bytes (225 bytes) from the internal disk record  into the user-provided buffer. Because this copy occurs for each disk entry, we can infer that each disk record stored internally by the driver has a size of 225 bytes.
+
+```c
+memmove((void *)(v9 + v3), v8 + 2, 0xE1u);
+```
+
+Enumerating the function reveals where different pieces of information are written inside this structure. By tracking writes into the allocated record buffer, the layout of the structure can be reconstructed:
+
+```cpp
+struct DiskRecord
+{
+    char     DeviceName[100]; 
+    uint8_t  IsDrDevice;
+    uint32_t SectorSize;
+    uint64_t TotalSectors;
+    uint32_t AtaType;
+    uint32_t PartitionType;
+    uint32_t BusType;
+    char     Model[41];
+    uint8_t  _pad1[9];        // to reach offset 175
+    char     Serial[36];
+    uint8_t  _pad2[14];       // pad to 225 total
+};
+static_assert(sizeof(DiskRecord) == 225, "DiskRecord must be 225 bytes");
+```
+
+## Writing the Exploit
+With all of the information on how to interact with the driver it was time to write the code.
 
