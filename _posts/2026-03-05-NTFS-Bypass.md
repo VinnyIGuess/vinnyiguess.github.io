@@ -9,4 +9,4 @@ image:
 ---
 
 ## Introduction
-I recently started 
+I recently started exploring kernel-mode drivers for Bring Your Own Vulnerable Driver (BYOVD) attacks when conducting network testing. I found that many data forensics tools often export functions that can be leveraged for exploitation, like `ZwOpenSection`, `MmMapIoSpace`, & `ZwTerminateProcess`. A particular driver I found was using `IoBuildSynchronousFsdRequest` and `IofCallDriver` to read files from disk.sys bypassing NTFS protections. Unfortunately, the driver is not cross-signed by Microsoft, mitigating a lot of the impact. *I will update this post with the name of the driver once it is properly disclosed to the vendor*
