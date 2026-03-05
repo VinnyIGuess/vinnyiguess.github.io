@@ -17,19 +17,19 @@ To start analysing the program, I used the [Driver Buddy Revolutions Plugin](htt
 After all of this was done, I was able to quickly pull out the device name (`\Device\addriver`) and see what IOCTLs call certain functions. Various vulnerable functions can be called from IOCTLs, but for this post, we will focus on those that will help with reading files, bypassing NTFS restrictions (e.g., `0x8000E004`, `0x8000E000`).
 
 ## Finding The Vulnerability
-The handler for IOCTL `0x8000E000` (renamed by Claude to IoctlReadDiskSectors) processes a 112‑byte input buffer supplied by the caller.
+The IOCTL handler `0x8000E000` executes a function (renamed by Claude to IoctlReadDiskSectors)  that processes a 112‑byte input buffer supplied by the caller.
 
 Early in the function, the driver verifies the input size:
 
-```
+```[C]
 if (v6 && *(_DWORD *)(a2 + 16) == 112)
 ```
 
-*(a2 + 16) corresponds to InputBufferLength, confirming that the driver expects a fixed‑size 112‑byte structure.
+`(a2 + 16)` corresponds to InputBufferLength, confirming that the driver expects a fixed‑size 112‑byte structure.
 
-The first 100 bytes of the buffer are validated as a NULL‑terminated string:
+The first 100 (`0x64`) bytes of the buffer are validated as a NULL‑terminated string:
 
-```
+```[C]
 do {
     if (*v9 == 0)
         break;
@@ -40,7 +40,7 @@ This indicates that the beginning of the buffer contains a device name.
 
 Further down, two additional fields are read directly from the buffer:
 
-```
+```[C]
 v10 = *(_DWORD *)(v6 + 100);
 v19 = *(_QWORD *)(v6 + 104);
 ```
@@ -52,7 +52,7 @@ These offsets reveal the remaining structure fields:
 
 This is later passed to the function `IoBuildSynchronousFsdRequest` using `IRP_MJ_READ`, allowing for arbitrary read of disk sectors from user mode, effectively bypassing NTFS read restrictions entirely.
 
-```
+```[C]
 v16 = IoBuildSynchronousFsdRequest(
     3u,                                          // IRP_MJ_READ (major function code = read)
     *(PDEVICE_OBJECT *)((char *)v11 + 241),     // Target device object (selected disk) 
@@ -68,7 +68,7 @@ v16 = IoBuildSynchronousFsdRequest(
 
 Based on this, the IOCTL input buffer for our POC can be crafted like:
 
-```
+```[C]
 struct ReadSectorsInput
 {
     char     DiskName[100];
