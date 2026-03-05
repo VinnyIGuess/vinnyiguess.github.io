@@ -21,7 +21,7 @@ The IOCTL handler `0x8000E000` executes a function (renamed by Claude to IoctlRe
 
 Early in the function, the driver verifies the input size:
 
-```[C]
+```C
 if (v6 && *(_DWORD *)(a2 + 16) == 112)
 ```
 
@@ -29,7 +29,7 @@ if (v6 && *(_DWORD *)(a2 + 16) == 112)
 
 The first 100 (`0x64`) bytes of the buffer are validated as a NULL‑terminated string:
 
-```[C]
+```C
 do {
     if (*v9 == 0)
         break;
@@ -40,7 +40,7 @@ This indicates that the beginning of the buffer contains a device name.
 
 Further down, two additional fields are read directly from the buffer:
 
-```[C]
+```C
 v10 = *(_DWORD *)(v6 + 100);
 v19 = *(_QWORD *)(v6 + 104);
 ```
@@ -52,7 +52,7 @@ These offsets reveal the remaining structure fields:
 
 This is later passed to the function `IoBuildSynchronousFsdRequest` using `IRP_MJ_READ`, allowing for arbitrary read of disk sectors from user mode, effectively bypassing NTFS read restrictions entirely.
 
-```[C]
+```C
 v16 = IoBuildSynchronousFsdRequest(
     3u,                                          // IRP_MJ_READ (major function code = read)
     *(PDEVICE_OBJECT *)((char *)v11 + 241),     // Target device object (selected disk) 
@@ -68,7 +68,7 @@ v16 = IoBuildSynchronousFsdRequest(
 
 Based on this, the IOCTL input buffer for our POC can be crafted like:
 
-```[C]
+```C
 struct ReadSectorsInput
 {
     char     DiskName[100];
