@@ -50,7 +50,7 @@ These offsets reveal the remaining structure fields:
 
 `+0x68` (104) → starting LBA
 
-This is later passed to the function `IoBuildSynchronousFsdRequest` using `IRP_MJ_READ`, allowing for arbitrary read of disk sectors from user mode.
+This is later passed to the function `IoBuildSynchronousFsdRequest` using `IRP_MJ_READ`, allowing for arbitrary read of disk sectors from user mode, effectively bypassing NTFS rescritions entirely.
 
 ```
 v16 = IoBuildSynchronousFsdRequest(
